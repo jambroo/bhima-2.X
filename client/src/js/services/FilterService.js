@@ -88,7 +88,7 @@ function FilterService(Store) {
   // return filters for the view - this method will always be compatible with the bhFilter component
   FilterList.prototype.formatView = function formatView() {
     var activeFilters = this._filterActiveFilters();
-    var activeKeys = activeFilters.map(function (filter) {  return filter._key; });
+    var activeKeys = activeFilters.map(function (filter) { return filter._key; });
 
     function keysInActive(filter) { return activeKeys.indexOf(filter._key) !== -1; }
 
@@ -156,8 +156,8 @@ function FilterService(Store) {
 
     Object.keys(this._filterIndex).forEach(function (key) {
       var filter = this._filterIndex[key];
-
-      if (filter._value) {
+      
+      if (filter._value !== null && filter._value !== undefined && filter._value.length !== '') {
         filtered.push(angular.copy(filter));
       }
     }.bind(this));

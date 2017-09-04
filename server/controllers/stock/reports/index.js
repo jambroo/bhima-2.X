@@ -13,6 +13,7 @@ const identifiers = require('../../../config/identifiers');
 const NotFound = require('../../../lib/errors/NotFound');
 const ReportManager = require('../../../lib/ReportManager');
 
+const PeriodService = require('../../../lib/period');
 const Stock = require('../core');
 
 const BASE_PATH = './server/controllers/stock/reports';
@@ -35,6 +36,39 @@ const STOCK_INVENTORIES_REPORT_TEMPLATE = `${BASE_PATH}/stock_inventories.report
 const STOCK_INVENTORY_REPORT_TEMPLATE = `${BASE_PATH}/stock_inventory.report.handlebars`;
 
 // ===================================== receipts ========================================
+
+/*
+* This function help to format filter display name
+* Whitch must appear in the report
+*/
+function formatFilters(qs) {
+  const columns = [
+    { field : 'depot_uuid', displayName : 'STOCK.DEPOT' },
+    { field : 'inventory_uuid', displayName : 'STOCK.INVENTORY' },
+    { field : 'status', displayName : 'FORM.LABELS.STATUS' },
+    { field : 'defaultPeriod', displayName : 'TABLE.COLUMNS.PERIOD', isPeriod : true },
+    { field : 'period', displayName : 'TABLE.COLUMNS.PERIOD', isPeriod : true },
+    { field : 'limit', displayName : 'FORM.LABELS.LIMIT' },
+
+    { field : 'entry_date_from', displayName : 'STOCK.ENTRY_DATE', comparitor : '>', isDate : true },
+    { field : 'entry_date_to', displayName : 'STOCK.ENTRY_DATE', comparitor : '<', isDate : true },
+  ];
+
+  return columns.filter(column => {
+    const value = qs[column.field];
+
+    if (!_.isUndefined(value)) {
+      if (column.isPeriod) {
+        const service = new PeriodService(new Date());
+        column.value = service.periods[value].translateKey;
+      } else {
+        column.value = value;
+      }
+      return true;
+    }
+    return false;
+  });
+}
 
 /**
  * @method stockExitPatientReceipt
@@ -323,7 +357,7 @@ function stockExitDepotReceipt(req, res, next) {
     return next(e);
   }
 
-  return getDepotMovement(documentUuid, req.session.enterprise)
+  return getDepotMovement(documentUuid, req.session.enterprise, true)
     .then(data => report.render(data))
     .then(result => res.set(result.headers).send(result.report))
     .catch(next)
@@ -351,7 +385,7 @@ function stockEntryDepotReceipt(req, res, next) {
     return next(e);
   }
 
-  return getDepotMovement(documentUuid, req.session.enterprise)
+  return getDepotMovement(documentUuid, req.session.enterprise, false)
     .then(data => report.render(data))
     .then(result => res.set(result.headers).send(result.report))
     .catch(next)
@@ -513,38 +547,49 @@ function stockEntryIntegrationReceipt(req, res, next) {
  * getDepotMovement
  * @param {string} documentUuid
  * @param {object} enterprise
+ * @param {boolean} isExit 
  * @description return depot movement informations
  * @return {object} data
  */
-function getDepotMovement(documentUuid, enterprise) {
+function getDepotMovement(documentUuid, enterprise, isExit) {
   const data = {};
+  const is_exit = isExit ? 1 : 0;
   const sql = `
-    SELECT i.code, i.text, BUID(m.document_uuid) AS document_uuid,
-      m.quantity, m.unit_cost, (m.quantity * m.unit_cost) AS total , m.date, m.description,
-      u.display_name AS user_display_name,
-      CONCAT_WS('.', '${identifiers.DOCUMENT.key}', m.reference) AS document_reference,
-      l.label, l.expiration_date, d.text AS depot_name
-    FROM stock_movement m
-    JOIN lot l ON l.uuid = m.lot_uuid
-    JOIN inventory i ON i.uuid = l.inventory_uuid
-    JOIN depot d ON d.uuid = m.depot_uuid
-    JOIN user u ON u.id = m.user_id
-    WHERE m.is_exit = ? AND m.flux_id = ? AND m.document_uuid = ?
-  `;
+        SELECT 
+          i.code, i.text, BUID(m.document_uuid) AS document_uuid,
+          m.quantity, m.unit_cost, (m.quantity * m.unit_cost) AS total, m.date, m.description,
+          u.display_name AS user_display_name,
+          CONCAT_WS('.', '${identifiers.DOCUMENT.key}', m.reference) AS document_reference,
+          l.label, l.expiration_date, d.text AS depot_name, dd.text as otherDepotName
+        FROM 
+          stock_movement m
+        JOIN 
+          lot l ON l.uuid = m.lot_uuid
+        JOIN 
+          inventory i ON i.uuid = l.inventory_uuid
+        JOIN 
+          depot d ON d.uuid = m.depot_uuid
+        JOIN 
+          user u ON u.id = m.user_id
+        LEFT JOIN 
+          depot dd ON dd.uuid = entity_uuid
+        WHERE 
+          m.is_exit = ? AND m.flux_id = ? AND m.document_uuid = ?`;
 
-  return db.exec(sql, [1, Stock.flux.TO_OTHER_DEPOT, db.bid(documentUuid)])
+  return db.exec(sql, [is_exit, isExit ? Stock.flux.TO_OTHER_DEPOT : Stock.flux.FROM_OTHER_DEPOT, db.bid(documentUuid)])
     .then((rows) => {
-      // exit movement
       if (!rows.length) {
         throw new NotFound('document not found for exit');
-      }
+      }      
       const line = rows[0];
 
       data.enterprise = enterprise;
-      data.exit = {};
+      const key = isExit ? 'exit' : 'entry';
+      data[key] = {};
 
-      data.exit.details = {
+      data[key].details = {
         depot_name         : line.depot_name,
+        otherDepotName     : line.otherDepotName || '',
         user_display_name  : line.user_display_name,
         description        : line.description,
         date               : line.date,
@@ -553,27 +598,7 @@ function getDepotMovement(documentUuid, enterprise) {
       };
 
       data.rows = rows;
-      return db.exec(sql, [0, Stock.flux.FROM_OTHER_DEPOT, db.bid(documentUuid)]);
-    })
-    .then((rows) => {
-      // entry movement
-      if (!rows.length) {
-        throw new NotFound('document not found for entry');
-      }
-      const line = rows[0];
-
-      data.enterprise = enterprise;
-      data.entry = {};
-
-      data.entry.details = {
-        depot_name         : line.depot_name,
-        user_display_name  : line.user_display_name,
-        description        : line.description,
-        date               : line.date,
-        document_uuid      : line.document_uuid,
-        document_reference : line.document_reference,
-      };
-      return data;
+      return data ;
     });
 }
 
@@ -595,6 +620,7 @@ function stockLotsReport(req, res, next) {
 
   const data = {};
   let report;
+
   const optionReport = _.extend(req.query, {
     filename : 'TREE.STOCK_LOTS',
     orientation : 'landscape',
@@ -620,12 +646,14 @@ function stockLotsReport(req, res, next) {
     delete options.defaultPeriod;
   }
 
+
   return Stock.getLotsDepot(null, options)
     .then((rows) => {
       data.rows = rows;
       data.hasFilter = hasFilter;
       data.csv = rows;
       data.display = display;
+      data.filters = formatFilters(options);
 
       // group by depot
       let depots = _.groupBy(rows, d => d.depot_text);
@@ -682,12 +710,14 @@ function stockMovementsReport(req, res, next) {
     return next(e);
   }
 
+
   return Stock.getLotsMovements(null, options)
     .then((rows) => {
       data.rows = rows;
       data.hasFilter = hasFilter;
       data.csv = rows;
       data.display = display;
+      data.filters = formatFilters(display);
 
       // group by depot
       let depots = _.groupBy(rows, d => d.depot_text);
@@ -708,6 +738,7 @@ function stockMovementsReport(req, res, next) {
     .done();
 }
 
+
 /**
  * @method stockInventoriesReport
  *
@@ -722,6 +753,7 @@ function stockInventoriesReport(req, res, next) {
   let display = {};
   let hasFilter = false;
   let report;
+  let filters;
 
   const data = {};
   const bundle = {};
@@ -739,6 +771,7 @@ function stockInventoriesReport(req, res, next) {
       options = JSON.parse(req.query.identifiers);
       display = JSON.parse(req.query.display);
       hasFilter = Object.keys(display).length > 0;
+      filters = formatFilters(display);
     } else if (req.query.params) {
       options = JSON.parse(req.query.params);
       bundle.delay = options.inventory_delay;
@@ -754,6 +787,7 @@ function stockInventoriesReport(req, res, next) {
     .then((rows) => {
       data.rows = rows;
       data.hasFilter = hasFilter;
+      data.filters = filters;
       data.csv = rows;
       data.display = display;
 
@@ -810,30 +844,30 @@ function stockInventoryReport(req, res, next) {
   }
 
   return db.one('SELECT code, text FROM inventory WHERE uuid = ?;', [db.bid(options.inventory_uuid)])
-  .then((inventory) => {
-    data.inventory = inventory;
+    .then((inventory) => {
+      data.inventory = inventory;
 
-    return db.one('SELECT text FROM depot WHERE uuid = ?;', [db.bid(options.depot_uuid)]);
-  })
-  .then((depot) => {
-    data.depot = depot;
+      return db.one('SELECT text FROM depot WHERE uuid = ?;', [db.bid(options.depot_uuid)]);
+    })
+    .then((depot) => {
+      data.depot = depot;
 
-    return Stock.getInventoryMovements(options);
-  })
-  .then((rows) => {
-    data.rows = rows.movements;
-    data.totals = rows.totals;
-    data.result = rows.result;
-    data.csv = rows.movements;
-    data.dateTo = options.dateTo;
+      return Stock.getInventoryMovements(options);
+    })
+    .then((rows) => {
+      data.rows = rows.movements;
+      data.totals = rows.totals;
+      data.result = rows.result;
+      data.csv = rows.movements;
+      data.dateTo = options.dateTo;
 
-    return report.render(data);
-  })
-  .then((result) => {
-    res.set(result.headers).send(result.report);
-  })
-  .catch(next)
-  .done();
+      return report.render(data);
+    })
+    .then((result) => {
+      res.set(result.headers).send(result.report);
+    })
+    .catch(next)
+    .done();
 }
 
 // expose to the api
